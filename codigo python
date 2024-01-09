@@ -1,0 +1,247 @@
+import json
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import LabelEncoder
+from collections import Counter
+import torch.optim as optim
+from sklearn.metrics import classification_report, accuracy_score, precision_recall_fscore_support
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Carga y procesamiento de datos
+
+# Cargar y procesar los datos
+def load_data(file):
+    with open(file, 'r') as f:
+        data = json.load(f)
+    samples = data["samples"]
+    texts = [sample["tokens"] for sample in samples]
+    tags = [sample["tags"] for sample in samples]
+    return texts, tags
+
+# Carga de datos
+train_texts, train_tags = load_data('/content/drive/MyDrive/ner_promed_train.json')
+test_texts, test_tags = load_data('/content/drive/MyDrive/ner_promed_test.json')
+
+# Etiquetas y tokens
+
+# Creación de un conjunto de etiquetas
+labels = set()
+for tags in train_tags + test_tags:
+    labels.update(tags)
+labels = list(labels)
+
+# Codificador de etiquetas
+label_encoder = LabelEncoder()
+label_encoder.fit(labels)
+
+# Crear un contador para todos los tokens en los datos de entrenamiento
+token_counter = Counter(token for text in train_texts for token in text)
+
+# Agregar tokens especiales para el manejo de palabras desconocidas y padding
+vocab = {"<PAD>": 0, "<UNK>": 1}
+vocab.update({token: idx + 2 for idx, (token, _) in enumerate(token_counter.most_common())})
+
+# Tamaño del vocabulario
+vocab_size = len(vocab)
+
+# Creación de los dataset
+
+class NERDataset(Dataset):
+    def __init__(self, texts, tags, label_encoder, max_length=128, vocab=None):
+        self.texts = texts
+        self.tags = tags
+        self.label_encoder = label_encoder
+        self.max_length = max_length
+        self.vocab = vocab
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        tokens = self.texts[idx]
+        tags = self.tags[idx]
+        token_indices = [self.vocab.get(token, self.vocab["<UNK>"]) for token in tokens]
+        token_indices = token_indices[:self.max_length] + [self.vocab["<PAD>"]] * (self.max_length - len(token_indices))
+        tag_indices = self.label_encoder.transform(tags)
+        tag_indices = tag_indices[:self.max_length].tolist() + [-100] * (self.max_length - len(tag_indices))
+        return torch.tensor(token_indices, dtype=torch.long), torch.tensor(tag_indices, dtype=torch.long)
+
+# Creación de Datasets
+train_dataset = NERDataset(train_texts, train_tags, label_encoder, vocab=vocab)
+test_dataset = NERDataset(test_texts, test_tags, label_encoder, vocab=vocab)
+
+# Función para manejar los lotes en el DataLoader
+def collate_fn(batch):
+    tokens, labels = zip(*batch)
+    return torch.stack(tokens), torch.stack(labels)
+
+# DataLoaders
+batch_size = 32
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn)
+
+
+# Modelo RNN
+
+# Definir el modelo RNN
+class RNNModel(nn.Module):
+    def __init__(self, vocab_size, hidden_size, num_layers, output_size, bidirectional, dropout):
+        super(RNNModel, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.rnn = nn.LSTM(hidden_size, hidden_size, num_layers=num_layers, bidirectional=bidirectional, batch_first=True)
+        self.fc = nn.Linear(hidden_size * 2 if bidirectional else hidden_size, output_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        x, _ = self.rnn(x)
+        x = self.fc(self.dropout(x))
+        return x
+
+# Inicializar el modelo RNN con el tamaño correcto del vocabulario
+output_size = len(label_encoder.classes_)
+rnn_model = RNNModel(vocab_size, hidden_size=128, num_layers=2, output_size=output_size, bidirectional=True, dropout=0.8)
+
+# Definir el optimizador y la función de pérdida
+optimizer = optim.Adam(rnn_model.parameters(), lr=2e-5)
+criterion = nn.CrossEntropyLoss(ignore_index=-100)
+
+
+# Función de entrenamiento
+def train(model, iterator, optimizer, criterion, device):
+    model.train()
+    total_loss = 0.0
+    for tokens, labels in iterator:
+        tokens, labels = tokens.to(device), labels.to(device)
+        optimizer.zero_grad()
+        predictions = model(tokens)
+        predictions = predictions.view(-1, output_size)
+        labels = labels.view(-1)
+        loss = criterion(predictions, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(iterator)
+
+# Función de evaluación
+def evaluate(model, iterator, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    all_predictions = []
+    all_labels = []
+
+    for tokens, labels in iterator:
+        tokens, labels = tokens.to(device), labels.to(device)
+        with torch.no_grad():
+            predictions = model(tokens)
+        predictions = predictions.view(-1, output_size)
+        labels = labels.view(-1)
+        loss = criterion(predictions, labels)
+        total_loss += loss.item()
+        all_predictions.extend(predictions.argmax(dim=1).cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+    return total_loss / len(iterator), all_predictions, all_labels
+
+# Métricas de rendimiento
+
+# Función para calcular métricas de rendimiento
+def calculate_metrics(predictions, labels, label_encoder):
+    # Convertir predicciones y etiquetas a etiquetas textuales
+    predictions = label_encoder.inverse_transform(predictions)
+    labels = label_encoder.inverse_transform(labels)
+
+    # Calcular y devolver las métricas
+    report = classification_report(labels, predictions, output_dict=True, zero_division=0)
+    f1_macro = report['macro avg']['f1-score']
+    return f1_macro
+
+# Configurar el dispositivo
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using {device} device")
+
+# Mover el modelo al dispositivo seleccionado
+rnn_model = rnn_model.to(device)
+
+
+# Visualización del entrenamiento
+
+# Entrenamiento y Evaluación con seguimiento de F1 macro promedio
+f1_scores = []
+N_EPOCHS = 10000
+for epoch in range(N_EPOCHS):
+    train_loss = train(rnn_model, train_loader, optimizer, criterion, device)
+
+    if (epoch + 1) % 10 == 0:
+        test_loss, test_predictions, test_labels = evaluate(rnn_model, test_loader, criterion, device)
+        f1_macro = calculate_metrics(test_predictions, test_labels, label_encoder)
+        f1_scores.append(f1_macro)
+        print(f"Epoch: {epoch+1:02}, Train Loss: {train_loss:.3f}, F1 Macro: {f1_macro:.3f}")
+    else:
+        print(f"Epoch: {epoch+1:02}, Train Loss: {train_loss:.3f}")
+
+# Visualizar la puntuación F1 macro promedio
+plt.plot(range(10, N_EPOCHS + 1, 10), f1_scores, marker='o')
+plt.xlabel('Epochs')
+plt.ylabel('F1 Macro')
+plt.title('F1 Macro Score Over Epochs')
+plt.grid(True)
+plt.show()
+
+# Visualización de predicciones
+
+# Función para invertir el mapeo del vocabulario: de índice a token
+def index_to_token(vocab, index):
+    for token, idx in vocab.items():
+        if idx == index:
+            return token
+    return "<UNK>"  # Retorna UNK si no se encuentra el índice
+
+# Función de visualización de predicciones
+def visualize_predictions(model, dataset, label_encoder, vocab, num_samples=5):
+    model.eval()
+    samples = torch.utils.data.Subset(dataset, indices=range(num_samples))
+    loader = DataLoader(samples, batch_size=1)
+
+    for tokens, true_labels in loader:
+        tokens, true_labels = tokens.to(device), true_labels.to(device)
+        with torch.no_grad():
+            predictions = model(tokens)
+            predictions = predictions.view(-1, output_size)
+            predicted_labels = predictions.argmax(dim=1).cpu().numpy()
+
+        # Convertir índices a etiquetas
+        predicted_labels = label_encoder.inverse_transform(predicted_labels)
+        true_labels = true_labels.view(-1).cpu().numpy()
+        true_labels = label_encoder.inverse_transform(true_labels)
+
+        # Visualizar las predicciones y las etiquetas reales
+        token_list = [index_to_token(vocab, t) for t in tokens[0].cpu().numpy()]
+        print("Tokens: ", token_list)
+        print("True Labels: ", true_labels)
+        print("Predicted Labels: ", predicted_labels)
+        print("\n")
+
+# Llamar a la función después de entrenar el modelo
+visualize_predictions(rnn_model, test_dataset, label_encoder, vocab, num_samples=5)
+
+# Cálculo de métricas en el conjunto de prueba
+
+# Función para calcular métricas de rendimiento
+def calculate_metricas(predictions, labels, label_encoder):
+    # Convertir predicciones y etiquetas a etiquetas textuales
+    predictions = label_encoder.inverse_transform(predictions)
+    labels = label_encoder.inverse_transform(labels)
+
+    # Calcular y mostrar las métricas
+    report = classification_report(labels, predictions)
+    print(report)
+
+# Calcular métricas en el conjunto de prueba
+test_loss, test_predictions, test_labels = evaluate(rnn_model, test_loader, criterion, device)
+print(f"Test Loss: {test_loss:.3f}")
+calculate_metricas(test_predictions, test_labels, label_encoder)
